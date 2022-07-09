@@ -84,6 +84,7 @@ print(pivoted_test.head)
 
 submission = pd.read_csv('./data/sample_submission.csv')
 
+
 x = jnp.array(x_train)
 y = np.array(y_train)
 
@@ -184,8 +185,9 @@ class TransformerThunk(hk.Module):
             x = AttentionBlock(num_heads=self.num_heads, head_size=self.head_size, ff_dim=self.ff_dim, dropout=self.dropout)(x, is_training)
         #t = einops.rearrange(x, 't c b -> t (c b)')
         out = TimeDistributed(hk.Linear(n_features), batch_first=True)(x)
-        out = jnn.sigmoid(out)
-        return hk.get_parameter('scl', shape=(1,), init=hki.Constant(1.0)) * out + hk.get_parameter('offs', shape=(1,), init=hki.Constant(1e-8))
+        return jnn.gelu(out)
+        #return hk.get_parameter('scl', shape=(1,), init=hki.Constant(1.0)) * out + hk.get_parameter('offs', shape=(1,), init=hki.Constant(1e-8))
+      
 
 def get_generator_parallel(x, y, rng_key, batch_size, num_devices):
     def batch_generator():
@@ -253,12 +255,12 @@ class GradientUpdater:
 
 def main():
     max_steps = 600
-    num_heads = 4
+    num_heads = 8
     head_size = 128
-    num_layers = 1
+    num_layers = 2
     dropout_rate = 0.3
     grad_clip_value = 1.0
-    learning_rate = 0.002
+    learning_rate = 0.0001
     time2vec_dim = 3
     batch_size = 128
     
@@ -327,6 +329,8 @@ def main():
             sample_id = np.int32(pivoted_test.iloc[[day_ith], [n_samples_per_day]].values[0][0])
             values = max(0, day_ith_pred.values[n_samples_per_day])
             submission.at[sample_id, 'sales'] = values
+
+    
 
     submission.to_csv('./data/result_submissions.csv', index=False)
 
