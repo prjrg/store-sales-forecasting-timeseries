@@ -20,56 +20,80 @@ import pandas as pd
 from sklearn.preprocessing import OrdinalEncoder, MinMaxScaler
 
 
-def make_multistep_target(ts, steps):
-    return pd.concat(
-        {f'y_step_{i + 1}': ts.shift(-i)
-         for i in range(steps)},
-        axis=1)
-
-def make_lags(ts, lags):
-    return pd.concat(
-        {
-            f'y_lag_{i}': ts.shift(i)
-            for i in range(1, lags + 1)
-        },
-        axis=1)
-
-
-def load_dataset(ftrain='./data/train.csv', ftest='./data/test.csv', fstores='./data/stores.csv', 
-                    fholidays='./data/holidays_events.csv', foil='./data/oil.csv', ftransact='./data/transactions.csv'):
-    train = pd.read_csv(ftrain, index_col=0)
-    test = pd.read_csv(ftest, index_col=0)
-    stores = pd.read_csv(fstores)
-    holidays = pd.read_csv(fholidays)
-    oil = pd.read_csv(foil)
-    transactions = pd.read_csv(ftransact)
-
-    holidays['date'] = pd.to_datetime(holidays['date'], format = "%Y-%m-%d")
-    oil['date'] = pd.to_datetime(oil['date'], format = "%Y-%m-%d")
-    transactions['date'] = pd.to_datetime(transactions['date'], format = "%Y-%m-%d")
-    train['date'] = pd.to_datetime(train['date'], format = "%Y-%m-%d")
-    test['date'] = pd.to_datetime(test['date'], format = "%Y-%m-%d")
-
-    object_cols = [cname for cname in train.columns 
-               if train[cname].dtype == "object" 
-               and cname != "date"]
-    num_cols = [cname for cname in train.columns 
-            if train[cname].dtype in ['int64', 'float64']]
+def split_series(series, n_past, n_future):
+    X, y = list(), list()
+    for window_start in range(len(series)):
+        past_end = window_start + n_past
+        future_end = past_end + n_future
+        if future_end > len(series):
+            break
+            
+        # slicing past and future
+        past, future = series[window_start:past_end,:], series[past_end:future_end,:]
+        X.append(past)
+        y.append(future)
     
-    ordinal_enc = OrdinalEncoder()
-    train[object_cols] = ordinal_enc.fit_transform(train[object_cols])
+    return np.array(X), np.array(y)
 
-    scaler = MinMaxScaler(feature_range=(0, 1))
 
-    for col in num_cols:
-        scaled_data = scaler.fit_transform(train[col].values.reshape(-1, 1))
-        train[col] = pd.Series(scaled_data.flatten())
+ftrain='./data/train.csv' 
+ftest='./data/test.csv' 
+fstores='./data/stores.csv', 
+fholidays='./data/holidays_events.csv'
+foil='./data/oil.csv'
+ftransact='./data/transactions.csv'
 
-    train_data = train.groupby(['date']).agg({'sales':'mean', 'onpromotion':'mean'})
-    x_train = train_data.copy()
-    y_train = train_data.sales.copy()
+train = pd.read_csv(ftrain, index_col=0)
+test = pd.read_csv(ftest, index_col=0)
+stores = pd.read_csv(fstores)
+holidays = pd.read_csv(fholidays)
+oil = pd.read_csv(foil)
+transactions = pd.read_csv(ftransact)
 
-    # Transforming into time series data
+holidays['date'] = pd.to_datetime(holidays['date'], format = "%Y-%m-%d")
+oil['date'] = pd.to_datetime(oil['date'], format = "%Y-%m-%d")
+transactions['date'] = pd.to_datetime(transactions['date'], format = "%Y-%m-%d")
+train['date'] = pd.to_datetime(train['date'], format = "%Y-%m-%d")
+test['date'] = pd.to_datetime(test['date'], format = "%Y-%m-%d")
+
+train["family"].nunique(dropna=True)
+
+train_data = train.copy().drop(['onpromotion'], axis=1)
+test_data = test.copy().drop(['onpromotion'], axis=1)
+
+ordinal_encoder = OrdinalEncoder(dtype=int)
+train_data[['family']] = ordinal_encoder.fit_transform(train_data[['family']])
+
+test_data[['family']] = ordinal_encoder.transform(test_data[['family']])
+n_o_days_train=train_data["date"].nunique(dropna = False)
+n_o_stores_train=train_data["store_nbr"].nunique(dropna = False)
+n_o_families_train=train_data["family"].nunique(dropna = False)
+n_o_days_test=test_data["date"].nunique(dropna = False) 
+n_o_stores_test=test_data["store_nbr"].nunique(dropna = False)
+n_o_families_test=test_data["family"].nunique(dropna = False) 
+
+pivoted_train = train_data.pivot(index=['date'], columns=['store_nbr', 'family'], values='sales')
+
+minmax = MinMaxScaler()
+minmax.fit(pivoted_train)
+
+scaled_train_samples = minmax.transform(pivoted_train)
+n_past = 16
+n_future = 16
+
+n_features = n_o_stores_train * n_o_families_train
+
+x_train, y_train = split_series(scaled_train_samples, n_past, n_future)
+
+pivoted_test = test_data.pivot(index=['date'], columns=['store_nbr', 'family'], values=None)
+
+submission = pd.read_csv('./data/sample_submission.csv')
+
+x = jnp.array(x_train)
+y = np.array(y_train)
+
+x_test = pivoted_test.values
+    
 
 
 # Model Definition
@@ -170,5 +194,150 @@ class TransformerThunk(hk.Module):
         out = jnn.sigmoid(out)
         return hk.get_parameter('scl', shape=(1,), init=hki.Constant(1.0)) * out + hk.get_parameter('offs', shape=(1,), init=hki.Constant(1e-8))
 
+def get_generator_parallel(x, y, rng_key, batch_size, num_devices):
+    def batch_generator():
+        n = x.shape[0]
+        key = rng_key
+        kk = batch_size // num_devices
+        while True:
+            key, k1 = jax.random.split(key)
+            perm = jax.random.choice(k1, n, shape=(batch_size,))
+            
+            yield x[perm, :].reshape(num_devices, kk, *x.shape[1:]), y[perm].reshape(num_devices, kk, *y.shape[1:])
+    return batch_generator()
 
-load_dataset()
+def replicate_tree(t, num_devices):
+    return jax.tree_map(lambda x: jnp.array([x] * num_devices), t)
+
+
+def build_forward_fn(num_layers, time2vec_dim, num_heads, head_size, ff_dim=None, dropout=0.5):
+    def forward_fn(x: jnp.ndarray, is_training: bool = True) -> jnp.ndarray:
+        tr = TransformerThunk(time2vec_dim, num_heads, head_size, ff_dim, num_layers, dropout)
+        return tr(x, is_training)
+
+    return forward_fn
+        
+     
+@ft.partial(jax.jit, static_argnums=(0, 6))
+def lm_loss_fn(forward_fn, params, state, rng, x, y, is_training: bool = True) -> jnp.ndarray:
+    y_pred, state = forward_fn(params, state, rng, x, is_training)
+    return jnp.sqrt(jnp.mean((jnp.square(y - y_pred)))), state
+
+
+class GradientUpdater:
+    def __init__(self, net_init, loss_fn, optimizer: optax.GradientTransformation):
+        self._net_init = net_init
+        self._loss_fn = loss_fn
+        self._opt = optimizer
+
+    def init(self, master_rng, x):
+        out_rng, init_rng = jax.random.split(master_rng)
+        params, state = self._net_init(init_rng, x)
+        opt_state = self._opt.init(params)
+        return jnp.array(0), out_rng, params, state, opt_state
+
+    def update(self, num_steps, rng, params, state, opt_state, x:jnp.ndarray, y: jnp.ndarray):
+        rng, new_rng = jax.random.split(rng)
+
+        (loss, state), grads = jax.value_and_grad(self._loss_fn, has_aux=True)(params, state, rng, x, y)
+
+        #loss = jax.lax.pmean(loss, axis_name='j')
+
+        grads = jax.lax.pmean(grads, axis_name='j')
+
+        updates, opt_state = self._opt.update(grads, opt_state, params)
+
+        params = optax.apply_updates(params, updates)
+
+        metrics = {
+            'step': num_steps,
+            'loss': loss,
+        }
+
+        return num_steps + 1, new_rng, params, state, opt_state, metrics
+
+
+def main():
+    max_steps = 2600
+    num_heads = 8
+    head_size = 16
+    num_layers = 4
+    dropout_rate = 0.3
+    grad_clip_value = 1.0
+    learning_rate = 0.004
+    time2vec_dim = 1
+    batch_size = 256
+    
+    num_devices = jax.local_device_count()
+
+    print("Num devices :::: ", num_devices)
+
+    print("Examples :::: ", x.shape)
+    print("Testing Examples :::: ", x_test.shape)
+
+    rng1, rng = jr.split(jax.random.PRNGKey(111))
+    train_dataset = get_generator_parallel(x, y, rng1, batch_size, num_devices)
+
+    forward_fn = build_forward_fn(num_layers, time2vec_dim, num_heads, head_size, dropout=dropout_rate)
+
+    forward_fn = hk.transform_with_state(forward_fn)
+
+    forward_apply = forward_fn.apply
+    loss_fn = ft.partial(lm_loss_fn, forward_apply)
+
+    optimizer = optax.chain(
+        optax.adaptive_grad_clip(grad_clip_value),
+        #optax.sgd(learning_rate=learning_rate, momentum=0.95, nesterov=True),
+        optax.radam(learning_rate=learning_rate)
+    )
+
+    updater = GradientUpdater(forward_fn.init, loss_fn, optimizer)
+
+    logging.info('Initializing parameters...')
+    rng1, rng = jr.split(rng)
+    a = next(train_dataset)
+    w, z = a
+    num_steps, rng, params, state, opt_state = updater.init(rng1, w[0, :, :, :])
+
+    params_multi_device = params
+    opt_state_multi_device = opt_state
+    num_steps_replicated = replicate_tree(num_steps, num_devices)
+    rng_replicated = rng
+    state_multi_device = state
+
+    fn_update = jax.pmap(updater.update, axis_name='j', in_axes=(0, None, None, None, None, 0, 0), out_axes=(0, None, None, None, None, 0))
+
+    logging.info('Starting train loop ++++++++...')
+    for i, (w, z) in zip(range(max_steps), train_dataset):
+        if (i + 1) % 100 == 0:
+            logging.info(f'Step {i} computing forward-backward pass')
+        num_steps_replicated, rng_replicated, params_multi_device, state_multi_device, opt_state_multi_device, metrics = \
+            fn_update(num_steps_replicated, rng_replicated, params_multi_device, state_multi_device, opt_state_multi_device, w, z)
+
+        if (i + 1) % 100 == 0:
+            logging.info(f'At step {i} the loss is {metrics}')
+    
+    # Test part of the model
+    forward_apply = jax.jit(forward_apply, static_argnames=['is_training'])
+    params_reduced = params_multi_device # Reduce parameters for single device
+    state_reduced = state_multi_device
+    N = x_test.shape[0]
+    
+  
+    fa, _ = forward_apply(params_reduced, state_reduced, rng,  x[-n_past:, :].reshape((1, n_past, n_features)), is_training=False)
+    
+    y_predict = pd.DataFrame(minmax.inverse_transform(fa.reshape((n_future, n_features))),columns=scaled_train_samples.columns)
+
+
+    for day_ith, day_ith_pred in y_predict.iterrows():
+        for n_samples_per_day in range(len(day_ith_pred)):
+            sample_id = pivoted_test.iloc[[day_ith], [n_samples_per_day]].values[0][0]
+            values = max(0, day_ith_pred.values[n_samples_per_day])
+            submission.at[sample_id, 'sales'] = values
+
+    submission.to_csv('./data/result_submissions.csv', index=False)
+
+
+if __name__ == "__main__":
+    logging.getLogger().setLevel(logging.INFO)
+    main()
