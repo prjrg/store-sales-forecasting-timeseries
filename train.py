@@ -38,23 +38,17 @@ def split_series(series, n_past, n_future):
 
 ftrain='./data/train.csv' 
 ftest='./data/test.csv' 
-fstores='./data/stores.csv', 
+fstores='./data/stores.csv'
 fholidays='./data/holidays_events.csv'
 foil='./data/oil.csv'
 ftransact='./data/transactions.csv'
 
-train = pd.read_csv(ftrain, index_col=0)
-test = pd.read_csv(ftest, index_col=0)
+train = pd.read_csv(ftrain)
+test = pd.read_csv(ftest)
 stores = pd.read_csv(fstores)
 holidays = pd.read_csv(fholidays)
 oil = pd.read_csv(foil)
 transactions = pd.read_csv(ftransact)
-
-holidays['date'] = pd.to_datetime(holidays['date'], format = "%Y-%m-%d")
-oil['date'] = pd.to_datetime(oil['date'], format = "%Y-%m-%d")
-transactions['date'] = pd.to_datetime(transactions['date'], format = "%Y-%m-%d")
-train['date'] = pd.to_datetime(train['date'], format = "%Y-%m-%d")
-test['date'] = pd.to_datetime(test['date'], format = "%Y-%m-%d")
 
 train["family"].nunique(dropna=True)
 
@@ -86,14 +80,13 @@ n_features = n_o_stores_train * n_o_families_train
 x_train, y_train = split_series(scaled_train_samples, n_past, n_future)
 
 pivoted_test = test_data.pivot(index=['date'], columns=['store_nbr', 'family'], values=None)
+print(pivoted_test.head)
 
 submission = pd.read_csv('./data/sample_submission.csv')
 
 x = jnp.array(x_train)
 y = np.array(y_train)
 
-x_test = pivoted_test.values
-    
 
 
 # Model Definition
@@ -189,8 +182,8 @@ class TransformerThunk(hk.Module):
         
         for i in range(self.num_layers):
             x = AttentionBlock(num_heads=self.num_heads, head_size=self.head_size, ff_dim=self.ff_dim, dropout=self.dropout)(x, is_training)
-        t = einops.rearrange(x, 't c b -> t (c b)')
-        out = hk.Linear(1)(t)
+        #t = einops.rearrange(x, 't c b -> t (c b)')
+        out = TimeDistributed(hk.Linear(n_features), batch_first=True)(x)
         out = jnn.sigmoid(out)
         return hk.get_parameter('scl', shape=(1,), init=hki.Constant(1.0)) * out + hk.get_parameter('offs', shape=(1,), init=hki.Constant(1e-8))
 
@@ -221,7 +214,8 @@ def build_forward_fn(num_layers, time2vec_dim, num_heads, head_size, ff_dim=None
 @ft.partial(jax.jit, static_argnums=(0, 6))
 def lm_loss_fn(forward_fn, params, state, rng, x, y, is_training: bool = True) -> jnp.ndarray:
     y_pred, state = forward_fn(params, state, rng, x, is_training)
-    return jnp.sqrt(jnp.mean((jnp.square(y - y_pred)))), state
+    #return jnp.sqrt(jnp.mean((jnp.abs(y_pred - y)))), state
+    return jnp.sqrt(jnp.mean(jnp.square(jnp.log(1 + y_pred) - jnp.log(1 + y)))), state
 
 
 class GradientUpdater:
@@ -258,22 +252,21 @@ class GradientUpdater:
 
 
 def main():
-    max_steps = 2600
-    num_heads = 8
-    head_size = 16
-    num_layers = 4
+    max_steps = 600
+    num_heads = 4
+    head_size = 128
+    num_layers = 1
     dropout_rate = 0.3
     grad_clip_value = 1.0
-    learning_rate = 0.004
-    time2vec_dim = 1
-    batch_size = 256
+    learning_rate = 0.002
+    time2vec_dim = 3
+    batch_size = 128
     
     num_devices = jax.local_device_count()
 
     print("Num devices :::: ", num_devices)
 
     print("Examples :::: ", x.shape)
-    print("Testing Examples :::: ", x_test.shape)
 
     rng1, rng = jr.split(jax.random.PRNGKey(111))
     train_dataset = get_generator_parallel(x, y, rng1, batch_size, num_devices)
@@ -309,29 +302,29 @@ def main():
 
     logging.info('Starting train loop ++++++++...')
     for i, (w, z) in zip(range(max_steps), train_dataset):
-        if (i + 1) % 100 == 0:
+        if (i + 1) % 10 == 0:
             logging.info(f'Step {i} computing forward-backward pass')
         num_steps_replicated, rng_replicated, params_multi_device, state_multi_device, opt_state_multi_device, metrics = \
             fn_update(num_steps_replicated, rng_replicated, params_multi_device, state_multi_device, opt_state_multi_device, w, z)
 
-        if (i + 1) % 100 == 0:
+        if (i + 1) % 10 == 0:
             logging.info(f'At step {i} the loss is {metrics}')
     
     # Test part of the model
     forward_apply = jax.jit(forward_apply, static_argnames=['is_training'])
     params_reduced = params_multi_device # Reduce parameters for single device
     state_reduced = state_multi_device
-    N = x_test.shape[0]
     
   
-    fa, _ = forward_apply(params_reduced, state_reduced, rng,  x[-n_past:, :].reshape((1, n_past, n_features)), is_training=False)
+    fa, _ = forward_apply(params_reduced, state_reduced, rng,  scaled_train_samples[-n_past:, :].reshape((1, n_past, n_features)), is_training=False)
     
-    y_predict = pd.DataFrame(minmax.inverse_transform(fa.reshape((n_future, n_features))),columns=scaled_train_samples.columns)
+    y_predict = pd.DataFrame(minmax.inverse_transform(fa.reshape((n_future, n_features))),columns=pivoted_train.columns)
 
+    pivoted_test = test_data.pivot(index=['date'], columns=['store_nbr', 'family'], values=None)
 
     for day_ith, day_ith_pred in y_predict.iterrows():
         for n_samples_per_day in range(len(day_ith_pred)):
-            sample_id = pivoted_test.iloc[[day_ith], [n_samples_per_day]].values[0][0]
+            sample_id = np.int32(pivoted_test.iloc[[day_ith], [n_samples_per_day]].values[0][0])
             values = max(0, day_ith_pred.values[n_samples_per_day])
             submission.at[sample_id, 'sales'] = values
 
